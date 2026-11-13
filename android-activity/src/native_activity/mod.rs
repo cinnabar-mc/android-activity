@@ -28,6 +28,7 @@ use crate::input::{
 
 mod glue;
 use self::glue::NativeActivityGlue;
+mod window_handoff;
 
 pub const LOOPER_ID_MAIN: libc::c_int = 1;
 pub const LOOPER_ID_INPUT: libc::c_int = 2;
@@ -181,7 +182,13 @@ impl AndroidAppInner {
     }
 
     pub fn native_window(&self) -> Option<NativeWindow> {
-        self.native_activity.mutex.lock().unwrap().window.clone()
+        self.native_activity
+            .mutex
+            .lock()
+            .unwrap()
+            .window
+            .adopted()
+            .cloned()
     }
 
     pub fn poll_events<F>(&self, timeout: Option<Duration>, mut callback: F)
@@ -189,6 +196,7 @@ impl AndroidAppInner {
         F: FnMut(PollEvent<'_>),
     {
         trace!("poll_events");
+        self.native_activity.notify_loop_started();
 
         unsafe {
             let mut fd: i32 = 0;
@@ -274,13 +282,15 @@ impl AndroidAppInner {
                                 };
 
                                 trace!("Calling pre_exec_cmd({ipc_cmd:#?})");
-                                self.native_activity.pre_exec_cmd(
+                                let deliver = self.native_activity.pre_exec_cmd(
                                     ipc_cmd,
                                     self.looper_as_ptr(),
                                     LOOPER_ID_INPUT,
                                 );
 
-                                if let Some(main_cmd) = main_cmd {
+                                if !deliver {
+                                    trace!("Dropping stale ID_MAIN command = {ipc_cmd:?}");
+                                } else if let Some(main_cmd) = main_cmd {
                                     trace!("Invoking callback for ID_MAIN command = {main_cmd:?}");
                                     callback(PollEvent::Main(main_cmd));
                                 }
