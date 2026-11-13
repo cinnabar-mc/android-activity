@@ -18,7 +18,7 @@ use crate::{
     ConfigurationRef,
 };
 
-use super::{AndroidApp, Rect};
+use super::{window_handoff::WindowHandoff, AndroidApp, Rect};
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug)]
 pub enum AppCmd {
@@ -237,15 +237,27 @@ pub struct NativeActivityState {
     pub config: ConfigurationRef,
     pub saved_state: Vec<u8>,
     pub input_queue: *mut ndk_sys::AInputQueue,
-    pub window: Option<NativeWindow>,
+    pub window: WindowHandoff<NativeWindow>,
     pub content_rect: ndk_sys::ARect,
     pub activity_state: State,
     pub destroy_requested: bool,
     pub thread_state: NativeThreadState,
     pub app_has_saved_state: bool,
 
+    /// The input queue Java last reported, which the native thread adopts when it handles
+    /// `InputQueueChanged`. Null once Java reported the queue destroyed.
     pub pending_input_queue: *mut ndk_sys::AInputQueue,
-    pub pending_window: Option<NativeWindow>,
+
+    /// Set by the first `poll_events` call.
+    ///
+    /// Until then the native thread is still starting the application and has adopted no
+    /// window or input queue, so Java callbacks queue their command and return instead of
+    /// blocking the Java main thread for however long that takes. Afterwards they wait for
+    /// the native thread to handle the command.
+    pub loop_started: bool,
+
+    /// `Start`, `Resume`, `Pause` and `Stop` commands written but not yet handled.
+    pub queued_activity_states: usize,
 }
 
 impl NativeActivityState {
@@ -383,7 +395,7 @@ impl WaitableNativeActivityState {
                 config,
                 saved_state,
                 input_queue: ptr::null_mut(),
-                window: None,
+                window: WindowHandoff::default(),
                 content_rect: Rect::empty().into(),
                 activity_state: State::Init,
                 destroy_requested: false,
@@ -391,7 +403,8 @@ impl WaitableNativeActivityState {
                 app_has_saved_state: false,
                 destroyed: false,
                 pending_input_queue: ptr::null_mut(),
-                pending_window: None,
+                loop_started: false,
+                queued_activity_states: 0,
             }),
             cond: Condvar::new(),
         }
@@ -440,66 +453,64 @@ impl WaitableNativeActivityState {
 
     pub fn notify_window_resized(&self, native_window: *mut ndk_sys::ANativeWindow) {
         let mut guard = self.mutex.lock().unwrap();
-        // set_window always syncs .pending_window back to .window before returning. This callback
-        // from Android can never arrive at an interim state, and validates that Android:
+        // This validates that Android:
         // 1. Only provides resizes in between onNativeWindowCreated and onNativeWindowDestroyed;
         // 2. Doesn't call it on a bogus window pointer that we don't know about.
-        debug_assert_eq!(guard.window.as_ref().unwrap().ptr().as_ptr(), native_window);
+        // The native thread may not have adopted the window yet.
+        debug_assert_eq!(
+            guard.window.reported().unwrap().ptr().as_ptr(),
+            native_window
+        );
         guard.write_cmd(AppCmd::WindowResized);
     }
 
     pub fn notify_window_redraw_needed(&self, native_window: *mut ndk_sys::ANativeWindow) {
         let mut guard = self.mutex.lock().unwrap();
-        // set_window always syncs .pending_window back to .window before returning. This callback
-        // from Android can never arrive at an interim state, and validates that Android:
+        // This validates that Android:
         // 1. Only provides resizes in between onNativeWindowCreated and onNativeWindowDestroyed;
         // 2. Doesn't call it on a bogus window pointer that we don't know about.
-        debug_assert_eq!(guard.window.as_ref().unwrap().ptr().as_ptr(), native_window);
+        // The native thread may not have adopted the window yet.
+        debug_assert_eq!(
+            guard.window.reported().unwrap().ptr().as_ptr(),
+            native_window
+        );
         guard.write_cmd(AppCmd::WindowRedrawNeeded);
     }
 
     unsafe fn set_input(&self, input_queue: *mut ndk_sys::AInputQueue) {
         let mut guard = self.mutex.lock().unwrap();
 
-        // The pending_input_queue state should only be set while in this method, and since
-        // it doesn't allow re-entrance and is cleared before returning then we expect
-        // this to be null
-        debug_assert!(
-            guard.pending_input_queue.is_null(),
-            "InputQueue update clash"
-        );
-
+        // The native thread adopts the latest reported queue whenever it handles an
+        // `InputQueueChanged`, so commands left from before the loop started are harmless.
         guard.pending_input_queue = input_queue;
         guard.write_cmd(AppCmd::InputQueueChanged);
+        if !guard.loop_started {
+            return;
+        }
         while guard.thread_state == NativeThreadState::Running
             && guard.input_queue != guard.pending_input_queue
         {
             guard = self.cond.wait(guard).unwrap();
         }
-        guard.pending_input_queue = ptr::null_mut();
     }
 
     unsafe fn set_window(&self, window: Option<NativeWindow>) {
         let mut guard = self.mutex.lock().unwrap();
 
-        // The pending_window state should only be set while in this method, and since
-        // it doesn't allow re-entrance and is cleared before returning then we expect
-        // this to be None
-        debug_assert!(guard.pending_window.is_none(), "NativeWindow update clash");
-
-        if guard.window.is_some() {
+        let cmds = guard.window.report(window);
+        if cmds.term {
             guard.write_cmd(AppCmd::TermWindow);
         }
-        guard.pending_window = window;
-        if guard.pending_window.is_some() {
+        if cmds.init {
             guard.write_cmd(AppCmd::InitWindow);
         }
-        while guard.thread_state == NativeThreadState::Running
-            && guard.window != guard.pending_window
-        {
+        if !guard.loop_started {
+            // The application owns no window yet, so there is nothing it must stop using.
+            return;
+        }
+        while guard.thread_state == NativeThreadState::Running && !guard.window.settled() {
             guard = self.cond.wait(guard).unwrap();
         }
-        guard.pending_window = None;
     }
 
     unsafe fn set_content_rect(&self, rect: *const ndk_sys::ARect) {
@@ -519,8 +530,15 @@ impl WaitableNativeActivityState {
             State::Stop => AppCmd::Stop,
         };
         guard.write_cmd(cmd);
+        guard.queued_activity_states += 1;
+        if !guard.loop_started {
+            return;
+        }
 
-        while guard.thread_state == NativeThreadState::Running && guard.activity_state != state {
+        // Commands are handled in order, so `activity_state` is `state` once none are queued.
+        // Waiting for the count keeps an equal state queued before the loop started from
+        // ending this wait early.
+        while guard.thread_state == NativeThreadState::Running && guard.queued_activity_states > 0 {
             guard = self.cond.wait(guard).unwrap();
         }
     }
@@ -528,15 +546,20 @@ impl WaitableNativeActivityState {
     fn request_save_state(&self) -> (*mut libc::c_void, libc::size_t) {
         let mut guard = self.mutex.lock().unwrap();
 
-        // The state_saved flag should only be set while in this method, and since
-        // it doesn't allow re-entrance and is cleared before returning then we expect
-        // this to be None
-        debug_assert!(!guard.app_has_saved_state, "SaveState request clash");
-        guard.write_cmd(AppCmd::SaveState);
-        while guard.thread_state == NativeThreadState::Running && !guard.app_has_saved_state {
-            guard = self.cond.wait(guard).unwrap();
+        // Before the event loop starts the application can't have new state to save, so the
+        // request is answered with the state the activity was created with. `SaveState` isn't
+        // queued either: its late acknowledgement would end the next request's wait early.
+        if guard.loop_started {
+            // The state_saved flag should only be set while in this method, and since
+            // it doesn't allow re-entrance and is cleared before returning then we expect
+            // this to be None
+            debug_assert!(!guard.app_has_saved_state, "SaveState request clash");
+            guard.write_cmd(AppCmd::SaveState);
+            while guard.thread_state == NativeThreadState::Running && !guard.app_has_saved_state {
+                guard = self.cond.wait(guard).unwrap();
+            }
+            guard.app_has_saved_state = false;
         }
-        guard.app_has_saved_state = false;
 
         // `ANativeActivity` explicitly documents that it expects save state to be
         // given via a `malloc()` allocated pointer since it will automatically
@@ -585,6 +608,11 @@ impl WaitableNativeActivityState {
         self.cond.notify_one();
     }
 
+    /// Records that the application polls for events, so later Java callbacks wait for it.
+    pub fn notify_loop_started(&self) {
+        self.mutex.lock().unwrap().loop_started = true;
+    }
+
     pub fn notify_main_thread_stopped_running(&self) {
         let mut guard = self.mutex.lock().unwrap();
         guard.thread_state = NativeThreadState::Stopped;
@@ -593,27 +621,38 @@ impl WaitableNativeActivityState {
         self.cond.notify_all();
     }
 
+    /// Prepares `cmd` for the application, returning whether to send it the matching event.
+    ///
+    /// Window commands queued before the loop started can be stale: an `InitWindow` whose
+    /// window was since destroyed or already delivered, and resizes or redraw requests for a
+    /// window the application never got. Those return `false` and must be dropped.
     pub unsafe fn pre_exec_cmd(
         &self,
         cmd: AppCmd,
         looper: *mut ndk_sys::ALooper,
         input_queue_ident: libc::c_int,
-    ) {
+    ) -> bool {
         log::trace!("Pre: AppCmd::{:#?}", cmd);
         match cmd {
             AppCmd::InputQueueChanged => {
                 let mut guard = self.mutex.lock().unwrap();
-                guard.detach_input_queue_from_looper();
-                guard.input_queue = guard.pending_input_queue;
-                if !guard.input_queue.is_null() {
-                    guard.attach_input_queue_to_looper(looper, input_queue_ident);
+                if guard.input_queue != guard.pending_input_queue {
+                    guard.detach_input_queue_from_looper();
+                    guard.input_queue = guard.pending_input_queue;
+                    if !guard.input_queue.is_null() {
+                        guard.attach_input_queue_to_looper(looper, input_queue_ident);
+                    }
                 }
                 self.cond.notify_one();
             }
             AppCmd::InitWindow => {
                 let mut guard = self.mutex.lock().unwrap();
-                guard.window = guard.pending_window.clone();
+                let adopted = guard.window.adopt();
                 self.cond.notify_one();
+                return adopted;
+            }
+            AppCmd::WindowResized | AppCmd::WindowRedrawNeeded => {
+                return self.mutex.lock().unwrap().window.adopted().is_some();
             }
             AppCmd::Resume | AppCmd::Start | AppCmd::Pause | AppCmd::Stop => {
                 let mut guard = self.mutex.lock().unwrap();
@@ -624,6 +663,7 @@ impl WaitableNativeActivityState {
                     AppCmd::Stop => State::Stop,
                     _ => unreachable!(),
                 };
+                guard.queued_activity_states = guard.queued_activity_states.saturating_sub(1);
                 self.cond.notify_one();
             }
             AppCmd::ConfigChanged => {
@@ -640,6 +680,7 @@ impl WaitableNativeActivityState {
             }
             _ => {}
         }
+        true
     }
 
     pub unsafe fn post_exec_cmd(&self, cmd: AppCmd) {
@@ -647,7 +688,7 @@ impl WaitableNativeActivityState {
         match cmd {
             AppCmd::TermWindow => {
                 let mut guard = self.mutex.lock().unwrap();
-                guard.window = None;
+                guard.window.release();
                 self.cond.notify_one();
             }
             AppCmd::SaveState => {

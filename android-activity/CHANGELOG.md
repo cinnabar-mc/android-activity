@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- native-activity: Lifecycle, window, input queue and save-state callbacks no longer block the Java main thread until the application first calls `AndroidApp::poll_events()`, so slow start-up work in `android_main()` can't cause an ANR. Commands are queued and delivered once the application polls; a window destroyed before then is never delivered, and a save-state request returns the state the activity was created with. Callbacks made after the first poll wait as before.
+
 ## [0.6.1] - 2026-03-30
 
 ### Added
